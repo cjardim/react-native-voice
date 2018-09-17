@@ -4,6 +4,8 @@
 #import <React/RCTUtils.h>
 #import <React/RCTEventEmitter.h>
 #import <Speech/Speech.h>
+#import <Accelerate/Accelerate.h>
+
 
 @interface Voice () <SFSpeechRecognizerDelegate>
 
@@ -20,6 +22,9 @@
 /** Previous category the user was on prior to starting speech recognition */
 @property (nonatomic) NSString* priorAudioCategory;
 
+/** Volume level Metering*/
+@property float averagePowerForChannel0;
+@property float averagePowerForChannel1;
 
 @end
 
@@ -95,6 +100,12 @@
     self.recognitionRequest = nil;
     self.sessionId = nil;
     self.isTearingDown = NO;
+
+    AVAudioSession *avAudioSession = [AVAudioSession sharedInstance];
+    if (avAudioSession) {
+        [avAudioSession setCategory:AVAudioSessionCategoryPlayback error:nil];
+        [avAudioSession setMode:AVAudioSessionModeDefault error:nil];
+    }
 }
 
 -(void) resetAudioSession {
@@ -121,6 +132,12 @@
     self.priorAudioCategory = [self.audioSession category];
     // Tear down resources before starting speech recognition..
     [self teardown];
+
+    if (self.audioSession) {
+        [self.audioSession setCategory:AVAudioSessionCategoryRecord error:nil];
+        [self.audioSession setMode:AVAudioSessionModeMeasurement error:nil];
+        [self.audioSession setActive:true withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
+    }
     
     self.sessionId = [[NSUUID UUID] UUIDString];
     
@@ -216,6 +233,31 @@
     // Start recording and append recording buffer to speech recognizer
     @try {
         [mixer installTapOnBus:0 bufferSize:1024 format:recordingFormat block:^(AVAudioPCMBuffer * _Nonnull buffer, AVAudioTime * _Nonnull when) {
+            //Volume Level Metering
+            //Buffer frame can be reduced, if you need more output values
+            [buffer setFrameLength:4096];
+            UInt32 inNumberFrames = buffer.frameLength;
+            float LEVEL_LOWPASS_TRIG = 0.5;
+            if(buffer.format.channelCount>0)
+            {
+                Float32* samples = (Float32*)buffer.floatChannelData[0];
+                Float32 avgValue = 0;
+                vDSP_maxmgv((Float32*)samples, 1, &avgValue, inNumberFrames);
+                self.averagePowerForChannel0 = (LEVEL_LOWPASS_TRIG*((avgValue==0)?-100:20.0*log10f(avgValue))) + ((1-LEVEL_LOWPASS_TRIG)*self.averagePowerForChannel0) ;
+                self.averagePowerForChannel1 = self.averagePowerForChannel0;
+            }
+            if(buffer.format.channelCount>1)
+            {
+                Float32* samples = (Float32*)buffer.floatChannelData[1];
+                Float32 avgValue = 0;
+                vDSP_maxmgv((Float32*)samples, 1, &avgValue, inNumberFrames);
+                self.averagePowerForChannel1 = (LEVEL_LOWPASS_TRIG*((avgValue==0)?-100:20.0*log10f(avgValue))) + ((1-LEVEL_LOWPASS_TRIG)*self.averagePowerForChannel1) ;
+            }
+            // Normalizing the Volume Value on scale of (0-10)
+            self.averagePowerForChannel1 = [self _normalizedPowerLevelFromDecibels:self.averagePowerForChannel1]*10;
+            NSNumber *value = [NSNumber numberWithFloat:self.averagePowerForChannel1];
+            [self sendEventWithName:@"onSpeechVolumeChanged" body:@{@"value": value}];
+            
             // Todo: write recording buffer to file (if user opts in)
             if (self.recognitionRequest != nil) {
                 [self.recognitionRequest appendAudioPCMBuffer:buffer];
@@ -236,6 +278,18 @@
         [self sendResult:@{@"code": @"audio", @"message": [audioSessionError localizedDescription]} :nil :nil :nil];
         [self teardown];
         return;
+    }
+}
+
+- (CGFloat)_normalizedPowerLevelFromDecibels:(CGFloat)decibels {
+    if (decibels < -80.0f || decibels == 0.0f) {
+        return 0.0f;
+    }
+    CGFloat power = powf((powf(10.0f, 0.05f * decibels) - powf(10.0f, 0.05f * -80.0f)) * (1.0f / (1.0f - powf(10.0f, 0.05f * -80.0f))), 1.0f / 2.0f);
+    if (power < 1.0f) {
+        return power;
+    }else{
+        return 1.0f;
     }
 }
 
@@ -260,7 +314,7 @@
         [self sendEventWithName:@"onSpeechResults" body:@{@"value":@[bestTranscription]} ];
     }
     if (transcriptions != nil) {
-        [self sendEventWithName:@"onSpeechPartialResults" body:@{@"value":transcriptions} ];
+        [self sendEventWithName:@"onSpeechPartialResults" body:@{@"value":transcriptions}];
     }
     if (isFinal != nil) {
         [self sendEventWithName:@"onSpeechRecognized" body: @{@"isFinal": isFinal}];
